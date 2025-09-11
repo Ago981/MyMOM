@@ -19,3 +19,7 @@ class MixdropExtractor(BaseExtractor):
 
         self.base_headers["referer"] = url
         return {
+            "destination_url": final_url,
+            "request_headers": self.base_headers,
+            "mediaflow_endpoint": self.mediaflow_endpoint,
+        }
