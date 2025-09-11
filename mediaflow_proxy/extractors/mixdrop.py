@@ -13,14 +13,8 @@ class MixdropExtractor(BaseExtractor):
             url = url.replace("club", "ps").split("/2")[0]
 
         headers = {"accept-language": "en-US,en;q=0.5"}
-        pattern = r'MDCore.wurl ?= ?"(.*?)"'
-        final_url = f"https:{await eval_solver(self, url, headers, pattern)}"
 
-
+        final_url = f"https:{await eval_solver(self, url, headers, r'MDCore.wurl ?= ?"(.*?)"')}"
 
         self.base_headers["referer"] = url
         return {
-            "destination_url": final_url,
-            "request_headers": self.base_headers,
-            "mediaflow_endpoint": self.mediaflow_endpoint,
-        }
