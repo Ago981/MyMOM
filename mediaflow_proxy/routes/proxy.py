@@ -1,9 +1,13 @@
+import asyncio
+import ipaddress
 import logging
 import re
 from functools import lru_cache
 from typing import Annotated
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlparse
 
+import aiohttp
+from aiohttp import ClientTimeout
 from fastapi import Request, Depends, APIRouter, Query, HTTPException, Response
 from fastapi.datastructures import QueryParams
 
@@ -30,6 +34,7 @@ from mediaflow_proxy.utils.extractor_helpers import (
     check_and_extract_sportsonline_stream,
 )
 from mediaflow_proxy.utils.hls_prebuffer import hls_prebuffer
+from mediaflow_proxy.utils.http_client import create_aiohttp_session
 from mediaflow_proxy.utils.http_utils import (
     get_proxy_headers,
     ProxyRequestHeaders,
@@ -450,6 +455,203 @@ def _build_hls_query_params(request: Request, destination: str) -> str:
         if key.startswith("h_"):
             params.append(f"{key}={quote(original[key], safe='')}")
     return "&".join(params)
+
+
+MEDIAFLOW_IP_PLACEHOLDER = "{mediaflow_ip}"
+_IP_DETECT_URLS = ["https://api.ipify.org", "https://checkip.amazonaws.com"]
+_cached_public_ip: str | None = None
+_public_ip_lock: asyncio.Lock | None = None
+
+
+async def _resolve_public_ip() -> str | None:
+    """Return MediaFlow's public IP: configured value, cached detection, or None."""
+    global _cached_public_ip, _public_ip_lock
+
+    if settings.public_ip:
+        return settings.public_ip
+    if _cached_public_ip:
+        return _cached_public_ip
+
+    if _public_ip_lock is None:
+        _public_ip_lock = asyncio.Lock()
+
+    async with _public_ip_lock:
+        if _cached_public_ip:
+            return _cached_public_ip
+        for url in _IP_DETECT_URLS:
+            try:
+                async with aiohttp.ClientSession() as sess:
+                    async with sess.get(url, timeout=ClientTimeout(total=5)) as resp:
+                        ip = (await resp.text()).strip()
+                        if ip:
+                            _cached_public_ip = ip
+                            return ip
+            except Exception:
+                continue
+    return None
+
+
+_IP_DISCLOSURE_HEADERS = frozenset(
+    {
+        "x-forwarded-for",
+        "x-real-ip",
+        "x-client-ip",
+        "true-client-ip",
+        "forwarded",
+        "cf-connecting-ip",
+        "x-original-forwarded-for",
+        "x-cluster-client-ip",
+    }
+)
+
+_HOP_BY_HOP_HEADERS = frozenset(
+    {
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailers",
+        "transfer-encoding",
+        "upgrade",
+    }
+)
+
+# Headers that callers must not inject via h_* params — they enable host-header
+# injection, HTTP request smuggling, or break the session's own framing logic.
+_BLOCKED_REQUEST_HEADERS = frozenset(
+    {
+        "host",
+        "content-length",
+        "transfer-encoding",
+        "content-encoding",
+    }
+)
+
+
+def _check_forward_destination(destination: str) -> None:
+    """SSRF guard and allowlist/denylist check for /proxy/forward."""
+    parsed = urlparse(destination)
+
+    # Only allow http(s) — blocks file://, ftp://, gopher://, data:, javascript:, etc.
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid URL scheme '{scheme}'. Only http and https are allowed.",
+        )
+
+    hostname = (parsed.hostname or "").lower()
+
+    if not hostname:
+        raise HTTPException(status_code=400, detail="Invalid destination URL: no hostname")
+
+    # Allowlist check (if configured)
+    allowed = settings.forward_allowed_hosts
+    if allowed and hostname not in {h.lower() for h in allowed}:
+        raise HTTPException(status_code=403, detail=f"Host '{hostname}' is not in forward_allowed_hosts")
+
+    # Explicit denylist
+    denied = {h.lower() for h in settings.forward_denied_hosts}
+    if hostname in denied:
+        raise HTTPException(status_code=403, detail=f"Host '{hostname}' is denied")
+
+    # Always block loopback literals
+    if hostname in ("localhost", "ip6-localhost", "ip6-loopback"):
+        raise HTTPException(status_code=403, detail="Forwarding to localhost is not allowed")
+
+    # Block private/loopback/link-local IPs given as literals
+    try:
+        addr = ipaddress.ip_address(hostname)
+        if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_unspecified:
+            raise HTTPException(status_code=403, detail="Forwarding to private/loopback addresses is not allowed")
+    except ValueError:
+        pass  # Not a numeric IP — hostname-based SSRF is the caller's responsibility
+
+
+@proxy_router.api_route(
+    "/forward",
+    methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+)
+async def proxy_forward_endpoint(
+    request: Request,
+    proxy_headers: Annotated[ProxyRequestHeaders, Depends(get_proxy_headers)],
+    destination: str = Query(..., description="The destination URL to forward to.", alias="d"),
+):
+    """
+    Generic transparent HTTP forwarding endpoint.
+
+    Forwards any HTTP method (including POST with body) to the given destination URL
+    using MediaFlow's outbound IP. Useful for IP-bound API calls (e.g. debrid service
+    APIs, extractor POST requests) where the request must appear to originate from
+    MediaFlow rather than the addon server.
+
+    Pass outbound headers via ``h_<name>=<value>`` query params. The upstream response
+    (status code, headers, body) is returned verbatim. IP-disclosure headers are
+    stripped before forwarding so the caller's IP is not leaked.
+    """
+    destination = sanitize_url(destination)
+    _check_forward_destination(destination)
+
+    # Strip IP-disclosure headers — the whole point is hiding the origin IP
+    for h in _IP_DISCLOSURE_HEADERS:
+        proxy_headers.request.pop(h, None)
+
+    # Strip headers that could enable host-header injection or HTTP smuggling
+    for h in _BLOCKED_REQUEST_HEADERS:
+        proxy_headers.request.pop(h, None)
+
+    body = await request.body()
+    if len(body) > settings.forward_max_request_body_bytes:
+        raise HTTPException(status_code=413, detail="Request body too large")
+    max_response_bytes = settings.forward_max_response_body_bytes
+
+    # Substitute {mediaflow_ip} placeholder with MediaFlow's actual public IP so
+    # debrid services receive a consistent ip= parameter that matches the TCP source.
+    if MEDIAFLOW_IP_PLACEHOLDER in destination or MEDIAFLOW_IP_PLACEHOLDER.encode() in body:
+        public_ip = await _resolve_public_ip()
+        if public_ip:
+            destination = destination.replace(MEDIAFLOW_IP_PLACEHOLDER, public_ip)
+            body = body.replace(MEDIAFLOW_IP_PLACEHOLDER.encode(), public_ip.encode())
+
+    async with create_aiohttp_session(destination) as (session, proxy_url):
+        try:
+            async with session.request(
+                method=request.method,
+                url=destination,
+                headers=proxy_headers.request,
+                data=body if body else None,
+                proxy=proxy_url,
+                timeout=ClientTimeout(total=settings.transport_config.timeout),
+                allow_redirects=True,
+            ) as upstream_resp:
+                resp_body = await upstream_resp.content.read(max_response_bytes + 1)
+                if len(resp_body) > max_response_bytes:
+                    raise HTTPException(status_code=502, detail="Upstream response too large")
+
+                resp_headers = {k: v for k, v in upstream_resp.headers.items() if k.lower() not in _HOP_BY_HOP_HEADERS}
+                resp_headers.update(proxy_headers.response)
+
+                return Response(
+                    content=resp_body,
+                    status_code=upstream_resp.status,
+                    headers=resp_headers,
+                )
+        except aiohttp.ClientResponseError as e:
+            raise HTTPException(status_code=e.status, detail=f"Upstream error: {e.message}")
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=504, detail="Upstream timeout")
+        except aiohttp.ClientError as e:
+            raise HTTPException(status_code=502, detail=f"Upstream connection error: {e}")
+
+
+@proxy_router.get("/ip")
+async def get_public_ip_endpoint():
+    """Return MediaFlow's public IP address."""
+    ip = await _resolve_public_ip()
+    if ip is None:
+        raise HTTPException(status_code=503, detail="Could not determine public IP")
+    return {"ip": ip}
 
 
 @proxy_router.head("/stream")

@@ -198,7 +198,7 @@ class HTTPMediaSource:
                 proxy=proxy_url,
                 allow_redirects=True,
             ) as resp:
-                cl = resp.headers.get("content-length")
+                cl = resp.headers.get("content-length") if resp.status < 400 else None
                 if cl:
                     self._file_size = int(cl)
                 else:

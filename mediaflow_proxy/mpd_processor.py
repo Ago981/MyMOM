@@ -664,60 +664,83 @@ def build_hls_playlist(
     init_proxy_url = request.url_for("init_endpoint")
     init_proxy_url = str(init_proxy_url.replace(scheme=get_original_scheme(request)))
 
-    for index, profile in enumerate(profiles):
-        segments = profile["segments"]
-        if not segments:
+    # Merge segments from all periods into a single ordered list.
+    # Multi-period MPDs can produce multiple profiles with the same unique_id (one per period);
+    # depth trimming must be applied to the combined segment list, not per-period.
+    merged: list[tuple[dict, dict]] = []
+    for profile in profiles:
+        if not profile["segments"]:
             logger.warning(f"No segments found for profile {profile['id']}")
             continue
+        for seg in profile["segments"]:
+            merged.append((seg, profile))
 
-        if is_live:
-            extinf_values_for_depth = [s["extinf"] for s in segments if "extinf" in s]
-            depth = _compute_live_playlist_depth(is_ts_mode, effective_start_offset, extinf_values_for_depth)
-            trimmed_segments = segments[-depth:]
-        else:
-            trimmed_segments = segments
+    if not merged:
+        return "\n".join(hls)
 
-        # Add headers for only the first profile
-        if index == 0:
-            first_segment = trimmed_segments[0]
-            extinf_values = [f["extinf"] for f in trimmed_segments if "extinf" in f]
+    if is_live:
+        extinf_values_for_depth = [e[0]["extinf"] for e in merged if "extinf" in e[0]]
+        depth = _compute_live_playlist_depth(is_ts_mode, effective_start_offset, extinf_values_for_depth)
+        merged = merged[-depth:]
 
-            # TS mode uses int(max)+1 to reduce buffer underruns in ExoPlayer
-            if is_ts_mode:
-                target_duration = int(max(extinf_values)) + 1 if extinf_values else 10
-            else:
-                target_duration = math.ceil(max(extinf_values)) if extinf_values else 3
+    # Emit playlist headers using the first trimmed segment's profile
+    first_segment, first_profile = merged[0]
+    extinf_values = [e[0]["extinf"] for e in merged if "extinf" in e[0]]
 
-            if is_live:
-                sequence = _compute_live_media_sequence(first_segment, profile, trimmed_segments)
-            else:
-                mpd_start_number = profile.get("segment_template_start_number")
-                sequence = first_segment.get("number")
-                if sequence is None:
-                    sequence = mpd_start_number if mpd_start_number is not None else 1
+    if is_ts_mode:
+        target_duration = int(max(extinf_values)) + 1 if extinf_values else 10
+    else:
+        target_duration = math.ceil(max(extinf_values)) if extinf_values else 3
 
-            hls.extend(
-                [
-                    f"#EXT-X-TARGETDURATION:{target_duration}",
-                    f"#EXT-X-MEDIA-SEQUENCE:{sequence}",
-                ]
-            )
-            # For live streams, don't set PLAYLIST-TYPE to allow sliding window
-            if not is_live:
-                hls.append("#EXT-X-PLAYLIST-TYPE:VOD")
+    if is_live:
+        sequence = _compute_live_media_sequence(first_segment, first_profile, [e[0] for e in merged])
+    else:
+        mpd_start_number = first_profile.get("segment_template_start_number")
+        sequence = first_segment.get("number")
+        if sequence is None:
+            sequence = mpd_start_number if mpd_start_number is not None else 1
 
+    hls.extend(
+        [
+            f"#EXT-X-TARGETDURATION:{target_duration}",
+            f"#EXT-X-MEDIA-SEQUENCE:{sequence}",
+        ]
+    )
+    # For live streams, don't set PLAYLIST-TYPE to allow sliding window
+    if not is_live:
+        hls.append("#EXT-X-PLAYLIST-TYPE:VOD")
+
+    query_params = dict(request.query_params)
+    query_params.pop("profile_id", None)
+    query_params.pop("d", None)
+    query_params.pop("remux_to_ts", None)  # per-request override; already resolved into endpoint choice
+    has_encrypted = query_params.pop("has_encrypted", False)
+
+    current_init_url = None  # track to detect period boundaries and re-emit EXT-X-MAP
+    need_discontinuity = False
+
+    for segment, profile in merged:
+        duration = segment["extinf"]
         init_url = profile["initUrl"]
         # For SegmentBase profiles, we may have byte range for initialization segment
         init_range = profile.get("initRange")
 
-        query_params = dict(request.query_params)
-        query_params.pop("profile_id", None)
-        query_params.pop("d", None)
-        query_params.pop("remux_to_ts", None)  # per-request override; already resolved into endpoint choice
-        has_encrypted = query_params.pop("has_encrypted", False)
+        # Check if this segment should be skipped
+        if skip_filter:
+            if skip_filter.should_skip_segment(duration):
+                skip_filter.advance_time(duration)
+                skipped_segments += 1
+                need_discontinuity = True
+                continue
+            skip_filter.advance_time(duration)
 
-        # Add EXT-X-MAP for init segment (for live streams or when beneficial)
-        if use_map:
+        # Emit EXT-X-MAP when init URL changes (first segment or period boundary in fMP4 mode)
+        if use_map and init_url != current_init_url:
+            if current_init_url is not None:
+                # Period boundary: insert discontinuity before new init
+                hls.append("#EXT-X-DISCONTINUITY")
+                need_discontinuity = False
+            current_init_url = init_url
             init_query_params = {
                 "init_url": init_url,
                 "mime_type": profile["mimeType"],
@@ -745,63 +768,50 @@ def build_hls_playlist(
             )
             hls.append(f'#EXT-X-MAP:URI="{init_map_url}"')
 
-        need_discontinuity = False
-        for segment in trimmed_segments:
-            duration = segment["extinf"]
+        # Add discontinuity marker after skipped segments
+        if need_discontinuity:
+            hls.append("#EXT-X-DISCONTINUITY")
+            need_discontinuity = False
 
-            # Check if this segment should be skipped
-            if skip_filter:
-                if skip_filter.should_skip_segment(duration):
-                    skip_filter.advance_time(duration)
-                    skipped_segments += 1
-                    need_discontinuity = True
-                    continue
-                skip_filter.advance_time(duration)
+        # Emit EXT-X-PROGRAM-DATE-TIME only for fMP4 (not TS)
+        program_date_time = segment.get("program_date_time")
+        if program_date_time and not is_ts_mode:
+            hls.append(f"#EXT-X-PROGRAM-DATE-TIME:{program_date_time}")
+        hls.append(f"#EXTINF:{duration:.3f},")
 
-            # Add discontinuity marker after skipped segments
-            if need_discontinuity:
-                hls.append("#EXT-X-DISCONTINUITY")
-                need_discontinuity = False
+        segment_query_params = {
+            "init_url": init_url,
+            "segment_url": segment["media"],
+            "mime_type": profile["mimeType"],
+            "is_live": "true" if is_live else "false",
+        }
 
-            # Emit EXT-X-PROGRAM-DATE-TIME only for fMP4 (not TS)
-            program_date_time = segment.get("program_date_time")
-            if program_date_time and not is_ts_mode:
-                hls.append(f"#EXT-X-PROGRAM-DATE-TIME:{program_date_time}")
-            hls.append(f"#EXTINF:{duration:.3f},")
+        # Add use_map flag so segment endpoint knows not to include init
+        if use_map and not is_ts_mode:
+            segment_query_params["use_map"] = "true"
+        elif is_ts_mode:
+            # TS segments are self-contained; init is always embedded by remuxer
+            segment_query_params["use_map"] = "false"
 
-            segment_query_params = {
-                "init_url": init_url,
-                "segment_url": segment["media"],
-                "mime_type": profile["mimeType"],
-                "is_live": "true" if is_live else "false",
-            }
+        # Add byte range parameters for SegmentBase
+        if init_range:
+            segment_query_params["init_range"] = init_range
+        # Segment may also have its own range (for SegmentBase)
+        if "initRange" in segment:
+            segment_query_params["init_range"] = segment["initRange"]
+        # Media byte range: bytes after the init segment (SegmentBase only)
+        if segment.get("mediaRange"):
+            segment_query_params["segment_range"] = segment["mediaRange"]
 
-            # Add use_map flag so segment endpoint knows not to include init
-            if use_map and not is_ts_mode:
-                segment_query_params["use_map"] = "true"
-            elif is_ts_mode:
-                # TS segments are self-contained; init is always embedded by remuxer
-                segment_query_params["use_map"] = "false"
-
-            # Add byte range parameters for SegmentBase
-            if init_range:
-                segment_query_params["init_range"] = init_range
-            # Segment may also have its own range (for SegmentBase)
-            if "initRange" in segment:
-                segment_query_params["init_range"] = segment["initRange"]
-            # Media byte range: bytes after the init segment (SegmentBase only)
-            if segment.get("mediaRange"):
-                segment_query_params["segment_range"] = segment["mediaRange"]
-
-            query_params.update(segment_query_params)
-            hls.append(
-                encode_mediaflow_proxy_url(
-                    proxy_url,
-                    query_params=query_params,
-                    encryption_handler=encryption_handler if has_encrypted else None,
-                )
+        query_params.update(segment_query_params)
+        hls.append(
+            encode_mediaflow_proxy_url(
+                proxy_url,
+                query_params=query_params,
+                encryption_handler=encryption_handler if has_encrypted else None,
             )
-            added_segments += 1
+        )
+        added_segments += 1
 
     if not mpd_dict["isLive"]:
         hls.append("#EXT-X-ENDLIST")

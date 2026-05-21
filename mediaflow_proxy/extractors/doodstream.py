@@ -152,6 +152,25 @@ class DoodStreamExtractor(BaseExtractor):
         html = r.text
         base_url = f"https://{urlparse(final_url).netloc}"
 
+        # Some pages embed a JS redirect instead of a real HTTP redirect.
+        js_redirect = re.search(r'(?:window\.location|location\.href)\s*=\s*[\'"]https?://([^/\'"]+)', html)
+        if js_redirect:
+            redirected_host = js_redirect.group(1)
+            redirect_url = f"https://{redirected_host}/e/{video_id}"
+            logger.debug("JS redirect detected → %s", redirect_url)
+            async with AsyncSession() as s2:
+                r2 = await s2.get(
+                    redirect_url,
+                    impersonate="chrome",
+                    headers={"Referer": f"https://{redirected_host}/"},
+                    timeout=30,
+                    allow_redirects=True,
+                    **({"proxy": proxy} if proxy else {}),
+                )
+            final_url = str(r2.url)
+            html = r2.text
+            base_url = f"https://{urlparse(final_url).netloc}"
+
         if "pass_md5" not in html:
             if "turnstile" in html.lower() or "captcha_l" in html:
                 raise ExtractorError(
@@ -196,6 +215,14 @@ class DoodStreamExtractor(BaseExtractor):
                 "(captcha session may have expired). "
                 "Ensure BYPARR_URL is set for reliable extraction."
             )
+
+        # CloudFlare R2 storage URLs are self-contained — no salt/token needed.
+        if "cloudflarestorage." in base_stream.lower():
+            return {
+                "destination_url": base_stream,
+                "request_headers": headers,
+                "mediaflow_endpoint": "proxy_stream_endpoint",
+            }
 
         token_match = re.search(r"token=([^&\s'\"]+)", html)
         if not token_match:
