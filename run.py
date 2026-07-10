@@ -31,6 +31,6 @@ def home():
 if __name__ == "__main__":
     import uvicorn
     # Legge la porta di Render, se non esiste usa la 8080 come backup per il locale
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.environ.get("PORT", 7860))
     uvicorn.run(main_app, host="0.0.0.0", port=port)
 
