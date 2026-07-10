@@ -12,4 +12,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 EXPOSE 7860
 
 # AVVIA L'APP ORIGINALE (Bypassando run.py che bloccava la UI)
-CMD ["uvicorn", "mediaflow_proxy.main:app", "--host", "0.0.0.0", "--port", "7860", "--workers", "4"]
+CMD ["uvicorn", "mediaflow_proxy.main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "4"]
